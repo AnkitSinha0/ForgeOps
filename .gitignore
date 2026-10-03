@@ -1,0 +1,12 @@
+.env
+bin/
+tmp/
+*.exe
+*.test
+*.out
+coverage.*
+
+# graphify knowledge-graph output (regenerable)
+graphify-out/
+/JIT/
+CLAUDE.md
