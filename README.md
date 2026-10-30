@@ -8,7 +8,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?style=flat-square&logo=postgresql&logoColor=white)](#tech-stack)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?style=flat-square&logo=redis&logoColor=white)](#tech-stack)
 [![Sandbox](https://img.shields.io/badge/sandbox-gVisor%20runsc-f97316?style=flat-square)](#security-model)
-[![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20phase%200%20of%2014%20done-f59e0b?style=flat-square)](#roadmap)
+[![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20phases%200%E2%80%931%20of%2014%20done-f59e0b?style=flat-square)](#roadmap)
 
 **Push to a Git repo. Get a live HTTPS URL. Safely.**<br>
 ForgeOps builds every commit in a gVisor sandbox, deploys it as an immutable container behind a dynamic router,<br>
@@ -21,7 +21,7 @@ and rolls back with a single registry write. Written in Go, self-hostable with D
 ---
 
 > [!IMPORTANT]
-> **ForgeOps has finished Phase 0 of its 14 phases (0–13).** The three services boot, connect to Postgres and Redis, serve health probes and shut down cleanly. Nothing builds or deploys yet.
+> **ForgeOps has finished Phases 0–1 of 14 (0–13).** The three services boot, serve health probes and shut down cleanly; the data model is migrated and its repositories are tested against real Postgres, tenant isolation included. Nothing builds or deploys yet.
 > The diagrams show the target design, and every feature names the phase that delivers it. This README is updated as phases land, and it never presents something that doesn't run yet as if it did.
 
 ## Why ForgeOps
@@ -39,7 +39,7 @@ Most "mini-Heroku" projects stop at "it deploys". ForgeOps is built around the h
 | Capability | What it means | Phase |
 |---|---|:-:|
 | **Health and graceful shutdown** | Liveness and readiness are separate probes; SIGTERM drains in-flight requests | 0 (done) |
-| **Tenant-scoped data layer** | Every query is scoped by tenant; secrets are encrypted at rest | 1–2 |
+| **Tenant-scoped data layer** | Every query is scoped by tenant, backed by composite foreign keys; secrets encrypted at rest in Phase 2 | 1 (done), 2 |
 | **Signed webhooks** | GitHub `X-Hub-Signature-256` HMAC is verified before anything is queued; `go-git` clones the exact commit | 3 |
 | **Build queue** | Redis-backed queue with atomic claims; per-build timeout and memory limit | 4 |
 | **Dynamic routing + auto TLS** | `httputil.ReverseProxy` driven by a Redis registry, certificates from ACME | 5 |
@@ -171,7 +171,7 @@ erDiagram
     BUILD }o--o{ BUILD_LAYER : "made of (ref-counted)"
 ```
 
-Phase 1 turns this into GORM models and repositories, and their fields are designed there. Every repository query is scoped by tenant, so one tenant can't read another tenant's rows, even if a handler has a bug.
+This is the Phase 1 schema ([`0001_init.sql`](internal/migrations/sql/0001_init.sql)). Every tenant-owned table carries `tenant_id` and points at its parent through a **composite foreign key** `(tenant_id, parent_id)`, so the database itself refuses a row that mixes two tenants. Every repository method takes a `tenantID`. Build layers are global and content-addressed; a layer's reference count is the number of builds pointing at it, and the database refuses to delete a layer still in use.
 
 ## Testing and reliability
 
@@ -196,8 +196,8 @@ Each phase ends with something runnable and a check that actually runs.
 | # | Phase | Done when | Status |
 |:-:|---|---|---|
 | 0 | Foundation | Three services start, connect to infra, pass probes, drain on SIGTERM | **done** |
-| 1 | Domain model and repositories | The schema migrates and every repository passes CRUD tests | next |
-| 2 | Control plane API, auth, tenancy | Create a project, set env vars and list deployments with `curl`; cross-tenant reads fail | planned |
+| 1 | Domain model and repositories | The schema migrates and every repository passes CRUD tests | **done** |
+| 2 | Control plane API, auth, tenancy | Create a project, set env vars and list deployments with `curl`; cross-tenant reads fail | next |
 | 3 | Git integration | A push to a connected repo clones the exact commit; a bad signature gets a 401 | planned |
 | 4 | Build executor | Push → build in a container → image; a build over its limit is killed cleanly | planned |
 | 5 | Deploy, router, TLS | Push to main → live on HTTPS in seconds → one-click rollback | planned |
@@ -257,6 +257,12 @@ docker compose -f deploy/docker-compose.yml start redis
 curl -i localhost:8082/readyz    # 200 again, with no service restart
 ```
 
+On first boot the controlplane applies the schema (`applied migration {"version": "0001_init"}`); later boots skip it.
+
+```bash
+make test-db                     # 10 repository tests against real Postgres, tenant isolation included
+```
+
 Press Ctrl+C in a service's terminal to stop it gracefully. `make down` stops the infrastructure, and `make reset` deletes its volumes too.
 
 ### Make targets
@@ -267,6 +273,7 @@ Press Ctrl+C in a service's terminal to stop it gracefully. `make down` stops th
 | `make logs` / `ps` | Follow the infrastructure logs / list its containers |
 | `make run-controlplane` / `run-executor` / `run-router` | Run one service with `go run` |
 | `make build` | Build all three binaries into `bin/` |
+| `make test-db` | Repository integration tests against the compose Postgres, each in its own throwaway schema (needs `make up`) |
 | `make test` / `vet` / `fmt` / `tidy` | Go tooling |
 
 ### Configuration
@@ -312,13 +319,16 @@ internal/
   database/            Postgres (GORM) and Redis clients with bounded pings
   health/              liveness vs readiness probes
   httpserver/          hardened timeouts, synchronous bind, graceful shutdown
+  migrations/          versioned SQL (embedded) + a runner that applies it once, in one transaction
+  models/              rows as Go structs, UUIDv4 IDs, status state machines
+  repositories/        tenant-scoped data access, sentinel errors, integration tests
 pkg/
   logger/              zap logger tagged with the service name
 deploy/                docker-compose.yml for local infrastructure
 docs/diagrams/         build.py, the source of every diagram in this README
 ```
 
-Planned packages, added in the phase that needs them: `models`, `repositories`, `services`, `handlers` (1–2), `git` (3), `queue`, `builder`, `sandbox` (4–6), `router` (5), `cache` (7), `logstream` (8), `observability` (10), plus `web/` (12) and `loadtest/` (11).
+Planned packages, added in the phase that needs them: `services`, `handlers` (2), `git` (3), `queue`, `builder`, `sandbox` (4–6), `router` (5), `cache` (7), `logstream` (8), `observability` (10), plus `web/` (12) and `loadtest/` (11).
 
 ## Engineering approach
 

@@ -22,3 +22,27 @@
 **DECISIONS.md entries that mattered most:** liveness/readiness split (verified behaviour), router least-privilege + separate ops port (sets up the Phase 6 security story).
 
 **Engineering Desk:** no post this phase. Nothing here is a contested trade-off or a failure big enough to be an article; the MinIO image removal is a one-paragraph note, not a story.
+
+## Phase 1 — Domain model & repositories (2026-10-30)
+
+**Intended:** seven models (Tenant, Project, EnvVar, Domain, Build, Deployment, BuildLayer), repositories with `ErrNotFound`, GORM AutoMigrate. Deliverable: schema migrates, CRUD tests pass.
+
+**Went well**
+- Deliverable met against real Postgres: 10 integration tests pass, and 3 more runs with `-shuffle=on` all passed. Each test gets its own schema, and no test schema was left behind.
+- Tenant isolation is enforced twice: `tenantID` in every repository signature, and composite foreign keys in the database. The isolation test was checked by deliberately removing the tenant filter: it went red (`got error <nil>, want record not found`).
+- Invariants moved into the database where it can see them: one live deployment per project (partial unique index), layer refs that can't drift (count rows plus RESTRICT), commit SHA / slug / digest formats (CHECK).
+- The controlplane migrates at boot. The second boot applies nothing.
+
+**Went wrong / surprised us**
+- The first run failed: attaching an unknown layer digest to a build that already had layers hit the `(build_id, position)` primary key before the foreign key. It was a test bug, but it was also a real lesson: when a row breaks two constraints, which error Postgres reports is not something to rely on.
+- The phase plan said AutoMigrate. The schema turned out to need things AutoMigrate can't express, so it became versioned SQL instead (DECISIONS.md).
+- `gofmt` flagged two files after a `sed`-inserted import and `" + table"` spacing. Run `gofmt -l` before calling a phase done.
+
+**Would change**
+- Write `Phase1.predict.md` before "go". This phase had no author predictions, so nothing was learned from the prediction step.
+
+**Predictions I got wrong:** none to review. `Phase1.predict.md` was empty at "go", and Claude filled it in at the author's request.
+
+**DECISIONS.md entries that mattered most:** composite-FK tenancy (the Phase 6 security story starts in the data layer), and ref-rows-as-refcount (it decides how Phase 7's GC works).
+
+**Engineering Desk:** no post yet. The candidate is "the counter that drifts: why ForgeOps counts layer references with rows, not a column". It's a real trade-off, but nothing failed for it, so it's held until Phase 7 confirms it under the GC.
