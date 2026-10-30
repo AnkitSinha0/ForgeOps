@@ -24,3 +24,28 @@ Would flip if: `pgsty/minio` stops publishing releases or lags on security fixes
 Why: three binaries that will run in containers. With defaults in `config.go` and overrides from env / `.env`, each binary starts from any working directory with zero files mounted. HashVault's required `config.yaml` makes the binary fail when started outside the repo root. Viper is used as an instance (`viper.New()`), not the global, so the three services and future tests share no hidden state.
 Alternative considered: HashVault's pattern (required config.yaml for tunables + .env for secrets) — rejected because it adds a file every container must mount and a second place to look for a value, with no benefit at this size.
 Would flip if: config grows values env vars express badly — lists, per-tenant maps, feature-flag tables — then a mounted config file earns its place. (reconstructed 2026-09-30)
+
+## [2026-10-30] Tenancy: `tenant_id` on every owned table + composite foreign keys + `tenantID` in every repository signature
+Why: a child row must never point at another tenant's parent. With `(tenant_id, project_id) REFERENCES projects (tenant_id, id)` the database checks the pair, so `tenant_id = B, project_id = <A's project>` is refused even if Go code has a bug (verified in `TestTenantIsolation`). Taking `tenantID` as a parameter makes forgetting the scope a compile error, not a leak.
+Alternative considered: `tenant_id` only on `projects` with joins (a forgotten join is a leak); single-column FKs (they accept mismatched pairs); Postgres row-level security (scoping hidden in per-connection session state that every pooled connection must set correctly).
+Would flip if: a non-Go client gets direct database access. Then RLS is the only enforcement that covers code you don't own.
+
+## [2026-10-30] Versioned SQL migrations with a small embedded runner, not GORM AutoMigrate (diverges from the phase plan)
+Why: the schema needs composite and three-column foreign keys, a partial unique index, CHECK regexes and mixed CASCADE/RESTRICT rules, none of which AutoMigrate can express. AutoMigrate also never drops or renames columns. One numbered SQL file is the schema, in one place, applied once, in one transaction, behind `LOCK TABLE schema_migrations`.
+Alternative considered: AutoMigrate plus raw SQL for constraints (the schema split across two places); goose / golang-migrate (right at scale, but one migration doesn't need it while learning what a migration tool does).
+Would flip if: down-migrations, non-transactional migrations (`CREATE INDEX CONCURRENTLY`) or a separate CI migrate step are needed. Then switch to goose, which reads the same numbered SQL files.
+
+## [2026-10-30] Primary keys are random UUIDv4 generated in Go (`BeforeCreate`), not sequences or database defaults
+Why: IDs appear in URLs, so they must not be guessable or leak volume. Random keys avoid the CockroachDB write hotspot (Phase 11b). Generating them in Go means the struct holds its ID straight after Create, on any database. BuildLayer keeps its digest as its natural key.
+Alternative considered: bigserial (guessable, hotspot); `DEFAULT gen_random_uuid()` (works, but needs RETURNING and a default in every target database); UUIDv7 (time-ordered, which brings the hotspot back).
+Would flip if: Postgres-only for good and random-insert index cost shows up in profiles. Then UUIDv7.
+
+## [2026-10-30] A layer's reference count is the number of `build_layer_refs` rows, not a counter column
+Why: builds are deleted by CASCADE (project or tenant delete), which runs no Go code, so a counter maintained in Go would drift upward and leak layers forever. Counting rows can't drift: deleting a project dropped the base layer's count from 2 to 1 on its own (`TestBuildLayerDedupAndRefCounting`). `ON DELETE RESTRICT` makes deleting a referenced layer impossible, which also settles the GC-vs-attach race inside the database.
+Alternative considered: a `ref_count` column (HashVault's storage_objects style). It drifts under cascades and is a hot row for popular base images.
+Would flip if: counting millions of refs gets slow on a hot path. Then add a counter maintained by a database trigger (triggers fire on cascades), never by application code.
+
+## [2026-10-30] Status changes are one conditional UPDATE (`WHERE status IN (allowed)`), judged by RowsAffected
+Why: read-then-write lets two workers both move a build from queued to building. The conditional update is atomic: exactly one wins and the other gets `ErrInvalidTransition` (verified). "One live deployment per project" is a unique partial index, so the database refuses a second live deployment (`ErrConflict`).
+Alternative considered: SELECT ... FOR UPDATE in a transaction (correct, but a lock plus extra round trips for a single-row decision).
+Would flip if: the decision depends on other rows (quotas: "fewer than N running builds per tenant", Phase 9). That needs a transaction with locking, or a counter in the same statement.

@@ -14,6 +14,7 @@ import (
 	"github.com/AnkitSinha0/forgeops/internal/database"
 	"github.com/AnkitSinha0/forgeops/internal/health"
 	"github.com/AnkitSinha0/forgeops/internal/httpserver"
+	"github.com/AnkitSinha0/forgeops/internal/migrations"
 	"github.com/AnkitSinha0/forgeops/pkg/logger"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -52,6 +53,12 @@ func run() error {
 		return err
 	}
 	defer func() { _ = database.ClosePostgres(db) }()
+
+	// Only the controlplane migrates: the schema has one owner, and the executor
+	// never boots against a half-migrated database it would have to wait for.
+	if err := migrations.Migrate(ctx, db, log); err != nil {
+		return fmt.Errorf("migrating: %w", err)
+	}
 
 	rdb, err := database.NewRedis(ctx, cfg.Redis, log)
 	if err != nil {
