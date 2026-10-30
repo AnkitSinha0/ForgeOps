@@ -1,0 +1,65 @@
+# Local infrastructure for ForgeOps. The three Go services run on the host
+# (go run / make run-*) and connect to these containers through published ports.
+#
+# Host ports are shifted (+1) from the defaults so this stack can run alongside
+# HashVault's compose stack, which already owns 5432 / 6379 / 9000.
+
+name: forgeops # without this, Compose names the project after the folder ("deploy")
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: forgeops
+      POSTGRES_PASSWORD: forgeops
+      POSTGRES_DB: forgeops
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgeops -d forgeops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: persist every write to disk so a restart does not lose the
+    # build queue (Phase 4) or the router registry (Phase 5).
+    command: redis-server --appendonly yes
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # S3-compatible object store for build artifacts / the layer cache (Phase 7).
+  # MinIO stopped publishing official community images in late 2025; pgsty/minio
+  # is a maintained build of the same server (same env vars, console and API).
+  # Pinned to a release tag, never :latest, so a rebuild cannot silently change it.
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: forgeops
+      MINIO_ROOT_PASSWORD: forgeops-secret
+    ports:
+      - "9010:9000" # S3 API
+      - "9011:9001" # web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
