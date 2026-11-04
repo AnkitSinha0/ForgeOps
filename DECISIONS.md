@@ -49,3 +49,17 @@ Would flip if: counting millions of refs gets slow on a hot path. Then add a cou
 Why: read-then-write lets two workers both move a build from queued to building. The conditional update is atomic: exactly one wins and the other gets `ErrInvalidTransition` (verified). "One live deployment per project" is a unique partial index, so the database refuses a second live deployment (`ErrConflict`).
 Alternative considered: SELECT ... FOR UPDATE in a transaction (correct, but a lock plus extra round trips for a single-row decision).
 Would flip if: the decision depends on other rows (quotas: "fewer than N running builds per tenant", Phase 9). That needs a transaction with locking, or a counter in the same statement.
+
+## [2026-11-04] Auth: per-tenant API keys, hashed with SHA-256 in Postgres, not JWT · Aditya
+> **Aditya's call:** "API keys for now. JWT can wait until the dashboard needs browser sessions."
+
+Why: Phases 2–11 are driven by `curl`, CI and scripts, and that's how GitHub, Heroku and Render tokens work. A key is `fo_` + 32 random bytes (base64url). It is shown once; only its SHA-256 is stored, with a unique index, so each request is one indexed lookup that resolves to exactly one `tenant_id`, which goes straight into the repository signatures. Revoking a key (`revoked_at`) kills it on the next request. A fast hash is enough because the key is high-entropy random, not a password.
+Alternative considered: JWT (no lookup to verify, but a stolen token lives until it expires unless there is a deny-list, which brings the lookup back; it also needs a signing key to rotate and has known pitfalls such as `alg: none` and algorithm confusion, a poor fit for a security-first project). bcrypt/argon2 on keys (slow per request, and it needs a key-ID prefix to look the hash up, with no benefit for random keys).
+Would flip if: the Phase 12 dashboard needs browser login sessions (then add short-lived sessions or JWTs next to the keys, for the UI only), or verification has to be stateless across many replicas and the per-request lookup shows up in profiles.
+
+## [2026-11-04] Bootstrap: the first tenant and API key come from a CLI subcommand, not an API endpoint or seed · Aditya
+> **Aditya's call:** "CLI command. Creating tenants shouldn't be something the public API can do."
+
+Why: with API keys on every route, the first key can't be created through the API. `controlplane admin create-tenant --name <n>` runs the same binary, connects straight to Postgres, creates the tenant through the existing repositories, prints the key once and stores only its SHA-256. Anyone who can run it already has shell access, and with it `DATABASE_DSN`, so it adds no new attack surface: no endpoint, and no second kind of credential to protect.
+Alternative considered: an `/admin/tenants` endpoint behind an `ADMIN_BOOTSTRAP_TOKEN` (a powerful route on the public API plus another secret to rotate); a seed migration with a fixed key (migrations run everywhere, so every install would share a key anyone can read in git).
+Would flip if: self-service signup is needed (Phase 12 dashboard). Then add a signup flow with its own rate limits; the CLI stays for operators.
