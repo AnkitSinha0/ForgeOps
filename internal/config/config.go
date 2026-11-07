@@ -23,6 +23,14 @@ type Config struct {
 	Router       RouterConfig
 	Database     DatabaseConfig
 	Redis        RedisConfig
+	Secrets      SecretsConfig
+}
+
+type SecretsConfig struct {
+	// Keys encrypts env vars at rest: "version:base64key" pairs (see secrets.ParseKeyring).
+	// Secret, never defaulted. Only the controlplane reads it, and it refuses to boot
+	// without one rather than failing on the first request.
+	Keys string
 }
 
 type AppConfig struct {
@@ -109,6 +117,9 @@ func Load() (*Config, error) {
 			Addr:     v.GetString("redis.addr"),
 			Password: v.GetString("redis.password"),
 			DB:       v.GetInt("redis.db"),
+		},
+		Secrets: SecretsConfig{
+			Keys: v.GetString("secrets.keys"),
 		},
 	}
 

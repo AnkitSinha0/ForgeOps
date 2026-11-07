@@ -1,82 +1,27 @@
 package repositories
 
 import (
+	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/AnkitSinha0/forgeops/internal/migrations"
 	"github.com/AnkitSinha0/forgeops/internal/models"
+	"github.com/AnkitSinha0/forgeops/internal/testdb"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 )
 
 // These are integration tests against a real Postgres. Constraints, cascades and
 // SQLSTATE codes are the behaviour under test, and a mock can't have any of them.
 //
 //	make up && make test-db
-//
-// Each test gets its own schema (a private namespace inside the database), runs
-// the real migrations into it and drops it afterwards. Tests share no rows, so
-// they can run in parallel and in any order.
-func newTestDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_DSN")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_DSN not set (make up && make test-db)")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	admin, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	buf := make([]byte, 6)
-	_, _ = rand.Read(buf)
-	schema := "test_" + hex.EncodeToString(buf)
-	if err := admin.WithContext(ctx).Exec("CREATE SCHEMA " + schema).Error; err != nil {
-		t.Fatalf("creating schema: %v", err)
-	}
-
-	// search_path in the DSN makes every pooled connection resolve unqualified
-	// table names to the test schema.
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parsing DSN: %v", err)
-	}
-	q := u.Query()
-	q.Set("search_path", schema)
-	u.RawQuery = q.Encode()
-	db, err := gorm.Open(postgres.Open(u.String()), &gorm.Config{Logger: gormlogger.Discard})
-	if err != nil {
-		t.Fatalf("connecting to schema: %v", err)
-	}
-	if err := migrations.Migrate(ctx, db, zap.NewNop()); err != nil {
-		t.Fatalf("migrating: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if sqlDB, err := db.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
-		_ = admin.Exec("DROP SCHEMA " + schema + " CASCADE").Error
-		if sqlDB, err := admin.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
-	})
-	return db
-}
+func newTestDB(t *testing.T) *gorm.DB { return testdb.New(t) }
 
 func wantErr(t *testing.T, got, want error) {
 	t.Helper()
@@ -118,11 +63,147 @@ func digest(n int) string { return fmt.Sprintf("sha256:%064x", n) }
 func TestMigrateIsIdempotent(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t) // already migrated once
+	var before, after int64
+	must(t, db.Raw("SELECT count(*) FROM schema_migrations").Scan(&before).Error)
 	must(t, migrations.Migrate(context.Background(), db, zap.NewNop()))
-	var n int64
-	must(t, db.Raw("SELECT count(*) FROM schema_migrations").Scan(&n).Error)
-	if n != 1 {
-		t.Fatalf("schema_migrations has %d rows after migrating twice, want 1", n)
+	must(t, db.Raw("SELECT count(*) FROM schema_migrations").Scan(&after).Error)
+	if before < 2 || after != before {
+		t.Fatalf("schema_migrations had %d rows, then %d after migrating again", before, after)
+	}
+}
+
+// ── API keys ────────────────────────────────────────────────────────────────
+
+func TestAPIKeyLifecycle(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	a, b := newFixture(t, db, "acme"), newFixture(t, db, "beta")
+	repo := NewAPIKeyRepository(db)
+	hash := bytes.Repeat([]byte{7}, 32)
+
+	k := &models.APIKey{TenantID: a.tenant.ID, Name: "ci", Prefix: "fo_12345678", KeyHash: hash}
+	must(t, repo.Create(ctx, k))
+	wantErr(t, repo.Create(ctx, &models.APIKey{TenantID: b.tenant.ID, Name: "dup", Prefix: "x", KeyHash: hash}), ErrConflict)
+	wantErr(t, repo.Create(ctx, &models.APIKey{TenantID: a.tenant.ID, Name: "short", Prefix: "x", KeyHash: []byte{1}}), ErrInvalid)
+
+	got, err := repo.FindActiveByHash(ctx, hash)
+	must(t, err)
+	if got.ID != k.ID || got.TenantID != a.tenant.ID {
+		t.Fatalf("FindActiveByHash = %+v", got)
+	}
+
+	list, err := repo.List(ctx, a.tenant.ID, nil, 10)
+	must(t, err)
+	if len(list) != 1 || len(list[0].KeyHash) != 0 {
+		t.Fatalf("List must return one key with no hash, got %+v", list)
+	}
+
+	// Another tenant can neither see nor revoke it.
+	other, err := repo.List(ctx, b.tenant.ID, nil, 10)
+	must(t, err)
+	if len(other) != 0 {
+		t.Fatalf("B sees A's keys: %+v", other)
+	}
+	wantErr(t, repo.Revoke(ctx, b.tenant.ID, k.ID), ErrNotFound)
+	if _, err := repo.FindActiveByHash(ctx, hash); err != nil {
+		t.Fatalf("the key must still work after B's failed revoke: %v", err)
+	}
+
+	must(t, repo.Revoke(ctx, a.tenant.ID, k.ID))
+	_, err = repo.FindActiveByHash(ctx, hash)
+	wantErr(t, err, ErrNotFound)
+	wantErr(t, repo.Revoke(ctx, a.tenant.ID, k.ID), ErrNotFound)
+}
+
+func TestCreateWithKeyIsAtomic(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	repo := NewTenantRepository(db)
+
+	// The key is invalid, so the tenant must not survive either.
+	bad := &models.Tenant{Name: "Acme", Slug: "acme"}
+	wantErr(t, repo.CreateWithKey(ctx, bad, &models.APIKey{Name: "first", Prefix: "x", KeyHash: []byte{1}}), ErrInvalid)
+	_, err := repo.FindBySlug(ctx, "acme")
+	wantErr(t, err, ErrNotFound)
+
+	k := &models.APIKey{Name: "first", Prefix: "x", KeyHash: bytes.Repeat([]byte{9}, 32)}
+	tn := &models.Tenant{Name: "Acme", Slug: "acme"}
+	must(t, repo.CreateWithKey(ctx, tn, k))
+	if k.TenantID != tn.ID {
+		t.Fatalf("key tenant %v, want %v", k.TenantID, tn.ID)
+	}
+}
+
+// ── pagination ──────────────────────────────────────────────────────────────
+
+// Rows with the same created_at are the case a timestamp-only cursor gets wrong.
+func TestDeploymentPagesCoverEveryRowWhenTimestampsTie(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	f := newFixture(t, db, "acme")
+	repo := NewDeploymentRepository(db)
+
+	same := time.Now().UTC().Truncate(time.Microsecond)
+	want := map[uuid.UUID]bool{}
+	for range 7 {
+		d := &models.Deployment{TenantID: f.tenant.ID, ProjectID: f.project.ID, BuildID: f.build.ID, CreatedAt: same}
+		must(t, repo.Create(ctx, d))
+		want[d.ID] = true
+	}
+
+	var after *TimeCursor
+	seen := map[uuid.UUID]bool{}
+	for page := 0; ; page++ {
+		if page > 7 {
+			t.Fatal("pagination did not terminate")
+		}
+		rows, err := repo.ListByProject(ctx, f.tenant.ID, f.project.ID, after, 3)
+		must(t, err)
+		if len(rows) == 0 {
+			break
+		}
+		for _, r := range rows {
+			if seen[r.ID] {
+				t.Fatalf("row %v appeared on two pages", r.ID)
+			}
+			seen[r.ID] = true
+		}
+		last := rows[len(rows)-1]
+		after = &TimeCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("saw %d of %d rows", len(seen), len(want))
+	}
+}
+
+func TestProjectAndEnvVarPages(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	ctx := context.Background()
+	f := newFixture(t, db, "acme") // already has project "web"
+	projects, envs := NewProjectRepository(db), NewEnvVarRepository(db)
+
+	for _, n := range []string{"alpha", "beta"} {
+		must(t, projects.Create(ctx, &models.Project{TenantID: f.tenant.ID, Name: n, RepoURL: "https://x/y", Branch: "main"}))
+	}
+	first, err := projects.List(ctx, f.tenant.ID, "", 2)
+	must(t, err)
+	second, err := projects.List(ctx, f.tenant.ID, first[1].Name, 2)
+	must(t, err)
+	if len(first) != 2 || first[0].Name != "alpha" || first[1].Name != "beta" || len(second) != 1 || second[0].Name != "web" {
+		t.Fatalf("pages = %+v / %+v", first, second)
+	}
+
+	for _, k := range []string{"A", "B", "C"} {
+		must(t, envs.Set(ctx, &models.EnvVar{TenantID: f.tenant.ID, ProjectID: f.project.ID, Key: k, Value: []byte("ciphertext")}))
+	}
+	keys, err := envs.ListKeys(ctx, f.tenant.ID, f.project.ID, "A", 10)
+	must(t, err)
+	if len(keys) != 2 || keys[0].Key != "B" || len(keys[0].Value) != 0 {
+		t.Fatalf("ListKeys = %+v, want B and C with no values", keys)
 	}
 }
 
@@ -167,7 +248,7 @@ func TestProjectCRUD(t *testing.T) {
 	wantErr(t, repo.Create(ctx, &models.Project{TenantID: f.tenant.ID, Name: "api", RepoURL: "x", Branch: "main"}), ErrConflict)
 	wantErr(t, repo.Create(ctx, &models.Project{TenantID: uuid.New(), Name: "ghost", RepoURL: "x", Branch: "main"}), ErrBadReference)
 
-	list, err := repo.List(ctx, f.tenant.ID)
+	list, err := repo.List(ctx, f.tenant.ID, "", 10)
 	must(t, err)
 	if len(list) != 2 || list[0].Name != "api" || list[1].Name != "web" {
 		t.Fatalf("List = %+v, want [api web]", list)
@@ -207,7 +288,7 @@ func TestTenantIsolation(t *testing.T) {
 	wantErr(t, err, ErrNotFound)
 	_, err = builds.FindByID(ctx, b.tenant.ID, a.build.ID)
 	wantErr(t, err, ErrNotFound)
-	list, err := projects.List(ctx, b.tenant.ID)
+	list, err := projects.List(ctx, b.tenant.ID, "", 10)
 	must(t, err)
 	if len(list) != 1 || list[0].ID != b.project.ID {
 		t.Fatalf("B's List = %+v, want only B's project", list)
@@ -409,7 +490,7 @@ func TestDeploymentOneLivePerProjectAndRollback(t *testing.T) {
 		t.Fatalf("v1 status = %q, want live", got.Status)
 	}
 	wantErr(t, repo.SetStatus(ctx, tid, v1.ID, models.DeploymentPending), ErrInvalidTransition)
-	list, err := repo.ListByProject(ctx, tid, f.project.ID, 10)
+	list, err := repo.ListByProject(ctx, tid, f.project.ID, nil, 10)
 	must(t, err)
 	if len(list) != 2 {
 		t.Fatalf("ListByProject returned %d, want 2", len(list))

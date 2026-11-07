@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	stdlog "log"
+	"os"
 	"time"
 
 	"github.com/AnkitSinha0/forgeops/internal/config"
@@ -12,6 +14,11 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
+
+// Now is the clock GORM stamps rows with. Go's clock has nanoseconds and timestamptz
+// stores microseconds, so without this a row's in-memory timestamp differs from what
+// any later read returns, and a create response disagrees with the GET after it.
+func Now() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
 
 // NewPostgres opens a pooled connection and proves it works with a ping, so a
 // bad DSN fails at boot instead of on the first request. The caller owns the
@@ -27,7 +34,16 @@ func NewPostgres(ctx context.Context, cfg config.DatabaseConfig, env string, log
 	}
 
 	db, err := gorm.Open(postgres.Open(cfg.DSN), &gorm.Config{
-		Logger: gormlogger.Default.LogMode(level),
+		Logger: gormlogger.New(stdlog.New(os.Stderr, "\r\n", stdlog.LstdFlags), gormlogger.Config{
+			SlowThreshold: 200 * time.Millisecond,
+			LogLevel:      level,
+			// Log "WHERE key_hash = $1", not the value. With this off, development
+			// logs would print key hashes and env var ciphertext.
+			ParameterizedQueries: true,
+			// An unknown API key is a normal outcome, not something to log as an error.
+			IgnoreRecordNotFoundError: true,
+		}),
+		NowFunc: Now,
 		// gorm.Open would otherwise ping with no deadline; an unreachable host
 		// could hang boot for minutes. We ping ourselves below, with a timeout.
 		DisableAutomaticPing: true,

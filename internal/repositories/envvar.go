@@ -2,7 +2,6 @@ package repositories
 
 import (
 	"context"
-	"time"
 
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/google/uuid"
@@ -17,8 +16,12 @@ type EnvVarRepository interface {
 	// when the key already exists, and changes nothing either way.
 	Set(ctx context.Context, e *models.EnvVar) error
 	Get(ctx context.Context, tenantID, projectID uuid.UUID, key string) (*models.EnvVar, error)
-	// List returns the project's variables ordered by key.
+	// List returns all of the project's variables with their values, ordered by key.
 	List(ctx context.Context, tenantID, projectID uuid.UUID) ([]models.EnvVar, error)
+	// ListKeys returns one page ordered by key, starting after afterKey ("" starts
+	// from the beginning). Value is left empty: ciphertext stays in the database
+	// unless something actually needs to decrypt it.
+	ListKeys(ctx context.Context, tenantID, projectID uuid.UUID, afterKey string, limit int) ([]models.EnvVar, error)
 	Delete(ctx context.Context, tenantID, projectID uuid.UUID, key string) error
 }
 
@@ -29,7 +32,10 @@ var _ EnvVarRepository = (*envVarRepo)(nil)
 func NewEnvVarRepository(db *gorm.DB) EnvVarRepository { return &envVarRepo{db: db} }
 
 func (r *envVarRepo) Set(ctx context.Context, e *models.EnvVar) error {
-	e.UpdatedAt = time.Now()
+	// One clock reading for both, so a new row can't have updated_at before created_at.
+	// On a conflict the existing created_at is kept, and RETURNING hands it back.
+	now := r.db.NowFunc()
+	e.CreatedAt, e.UpdatedAt = now, now
 	// One statement (INSERT ... ON CONFLICT DO UPDATE), not "find, then insert or
 	// update": two concurrent Sets of one key can't both insert. RETURNING hands
 	// back the id and created_at of the row that was kept.
@@ -65,6 +71,16 @@ func (r *envVarRepo) List(ctx context.Context, tenantID, projectID uuid.UUID) ([
 	var es []models.EnvVar
 	err := r.db.WithContext(ctx).
 		Where("tenant_id = ? AND project_id = ?", tenantID, projectID).Order("key").Find(&es).Error
+	return es, writeErr(err)
+}
+
+func (r *envVarRepo) ListKeys(ctx context.Context, tenantID, projectID uuid.UUID, afterKey string, limit int) ([]models.EnvVar, error) {
+	var es []models.EnvVar
+	q := r.db.WithContext(ctx).Omit("value").Where("tenant_id = ? AND project_id = ?", tenantID, projectID)
+	if afterKey != "" {
+		q = q.Where("key > ?", afterKey)
+	}
+	err := q.Order("key").Limit(limit).Find(&es).Error
 	return es, writeErr(err)
 }
 

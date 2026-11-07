@@ -46,3 +46,27 @@
 **DECISIONS.md entries that mattered most:** composite-FK tenancy (the Phase 6 security story starts in the data layer), and ref-rows-as-refcount (it decides how Phase 7's GC works).
 
 **Engineering Desk:** no post yet. The candidate is "the counter that drifts: why ForgeOps counts layer references with rows, not a column". It's a real trade-off, but nothing failed for it, so it's held until Phase 7 confirms it under the GC.
+
+## Phase 2 — Control plane API, auth, tenancy (2026-11-08)
+
+**Intended:** chi routes, project and env var CRUD with encryption at rest, auth, tenant isolation, keyset pagination. Deliverable: create a project, set env vars, list deployments via curl.
+
+**Went well**
+- Deliverable met with the real binary and curl, including the failure cases: no key is 401, another tenant's resource is 404, and Postgres holds only ciphertext and hashes.
+- 42 tests + 60 subtests pass, shuffled, and under `-race` in a Linux container.
+- Seven deliberate breakages were each caught by tests, so the security tests aren't hollow.
+
+**Went wrong / surprised us**
+- **A real cross-tenant hole had shipped in Phase 1.** `EnvVarRepository.Set` let any tenant overwrite another's variable, because a composite foreign key doesn't run on an upsert's update path. Ten passing tests, a mutation check and this file's praise of the isolation model all missed it. `TestTenantIsolation` tried inserts, never an upsert onto an existing key. It was found by reading the code while planning this phase, and nothing could reach it before this API existed.
+- Timestamps disagreed in two places: nanoseconds in responses vs microseconds stored (caught by a test), and `updated_at` before `created_at` (only caught by reading real curl output).
+- The Sonnet review found no high or medium issues, but it did find three low-severity bugs, one contradicting my own comment: `r.URL.Query()` silently dropped a malformed cursor.
+
+**Would change**
+- Write the isolation test per write path (insert, update, upsert, delete), not per resource.
+- Write `Phase2.predict.md`. There were no author predictions, for the second phase in a row.
+
+**Predictions I got wrong:** none to review. There's no `Phase2.predict.md`, because the author chose to start without one.
+
+**DECISIONS.md entries that mattered most:** the upsert tenant check, which corrects an earlier decision's claim; and write-only env vars with row-bound ciphertext, which set up Phase 6's security story.
+
+**Engineering Desk:** one draft in progress, on the foreign key that didn't fire. It's a real failure with a fix, not a clean success.

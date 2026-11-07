@@ -14,8 +14,9 @@ type DeploymentRepository interface {
 	// d.ProjectID in d.TenantID, or the result is ErrBadReference.
 	Create(ctx context.Context, d *models.Deployment) error
 	FindByID(ctx context.Context, tenantID, id uuid.UUID) (*models.Deployment, error)
-	// ListByProject returns the newest deployments first, at most limit of them.
-	ListByProject(ctx context.Context, tenantID, projectID uuid.UUID, limit int) ([]models.Deployment, error)
+	// ListByProject returns the newest deployments first, at most limit of them,
+	// starting after the cursor (nil starts from the newest).
+	ListByProject(ctx context.Context, tenantID, projectID uuid.UUID, after *TimeCursor, limit int) ([]models.Deployment, error)
 	// SetStatus moves the deployment to status if its current status allows it
 	// (models.DeploymentStatus.AllowedFrom), else ErrInvalidTransition. Making a
 	// second deployment of one project live returns ErrConflict.
@@ -41,11 +42,10 @@ func (r *deploymentRepo) FindByID(ctx context.Context, tenantID, id uuid.UUID) (
 	return &d, nil
 }
 
-func (r *deploymentRepo) ListByProject(ctx context.Context, tenantID, projectID uuid.UUID, limit int) ([]models.Deployment, error) {
+func (r *deploymentRepo) ListByProject(ctx context.Context, tenantID, projectID uuid.UUID, after *TimeCursor, limit int) ([]models.Deployment, error) {
 	var ds []models.Deployment
-	err := r.db.WithContext(ctx).
-		Where("tenant_id = ? AND project_id = ?", tenantID, projectID).
-		Order("created_at DESC, id").Limit(limit).Find(&ds).Error
+	q := r.db.WithContext(ctx).Where("tenant_id = ? AND project_id = ?", tenantID, projectID)
+	err := newestFirst(q, after, limit).Find(&ds).Error
 	return ds, writeErr(err)
 }
 

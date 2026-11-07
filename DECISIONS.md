@@ -26,7 +26,7 @@ Alternative considered: HashVault's pattern (required config.yaml for tunables +
 Would flip if: config grows values env vars express badly — lists, per-tenant maps, feature-flag tables — then a mounted config file earns its place. (reconstructed 2026-09-30)
 
 ## [2026-10-30] Tenancy: `tenant_id` on every owned table + composite foreign keys + `tenantID` in every repository signature
-Why: a child row must never point at another tenant's parent. With `(tenant_id, project_id) REFERENCES projects (tenant_id, id)` the database checks the pair, so `tenant_id = B, project_id = <A's project>` is refused even if Go code has a bug (verified in `TestTenantIsolation`). Taking `tenantID` as a parameter makes forgetting the scope a compile error, not a leak.
+Why: a child row must never point at another tenant's parent. With `(tenant_id, project_id) REFERENCES projects (tenant_id, id)` the database checks the pair, so `tenant_id = B, project_id = <A's project>` is refused even if Go code has a bug (verified in `TestTenantIsolation`; corrected 2026-11-08: this holds for inserts, not for an upsert's update path, see below). Taking `tenantID` as a parameter makes forgetting the scope a compile error, not a leak.
 Alternative considered: `tenant_id` only on `projects` with joins (a forgotten join is a leak); single-column FKs (they accept mismatched pairs); Postgres row-level security (scoping hidden in per-connection session state that every pooled connection must set correctly).
 Would flip if: a non-Go client gets direct database access. Then RLS is the only enforcement that covers code you don't own.
 
@@ -49,3 +49,39 @@ Would flip if: counting millions of refs gets slow on a hot path. Then add a cou
 Why: read-then-write lets two workers both move a build from queued to building. The conditional update is atomic: exactly one wins and the other gets `ErrInvalidTransition` (verified). "One live deployment per project" is a unique partial index, so the database refuses a second live deployment (`ErrConflict`).
 Alternative considered: SELECT ... FOR UPDATE in a transaction (correct, but a lock plus extra round trips for a single-row decision).
 Would flip if: the decision depends on other rows (quotas: "fewer than N running builds per tenant", Phase 9). That needs a transaction with locking, or a counter in the same statement.
+
+## [2026-11-08] The tenant check on an upsert lives in the statement (`DO UPDATE ... WHERE env_vars.tenant_id = EXCLUDED.tenant_id`)
+Why: this fixes a real hole from Phase 1. On a conflict Postgres updates the existing row, tenant_id doesn't change, and the composite foreign key never fires, so tenant B could overwrite tenant A's variable by naming its project ID and key (`TestEnvVarSetCannotOverwriteAnotherTenantsVariable` was red before the fix). The 2026-10-30 claim that the foreign key refuses mismatched pairs "even if Go code has a bug" holds for inserts only.
+Alternative considered: a project-ownership check in the service (leaves the repository unsafe for the next caller); conflicting on `(tenant_id, project_id, key)` (misses the existing row, then fails the old unique constraint and looks like a conflict).
+Would flip if: the table moves to row-level security, which covers every statement.
+
+## [2026-11-08] Auth is per-tenant API keys, stored as SHA-256, checked in the database on every request
+Why: callers are curl and CI today. One indexed lookup resolves the tenant, and a revoke applies to the next request (verified). A leaked table holds nothing usable, and a 256-bit random key can't be guessed, so a slow hash adds only per-request cost.
+Alternative considered: JWT (can't be revoked early without a server-side list, which brings the lookup back); bcrypt/argon2 (built for low-entropy passwords, and salting stops lookup by hash); a Redis cache (a revoked key keeps working until the entry expires).
+Would flip if: the Phase 12 dashboard needs browser logins, or lookups show up in profiles. Then a short-lived cache with a stated revocation delay.
+Note: `origin/Aditya` (68c7c15) proposes the same auth and bootstrap design. It was ignored at the author's request and isn't merged, but Claude had read its commit message before choosing, so this isn't independent agreement.
+
+## [2026-11-08] The first tenant and key come from a server-side CLI (`controlplane admin create-tenant`)
+Why: a new install has no credential, so no API call can authenticate. A CLI needs server access, adds no public route and no master secret, and also recovers a tenant that lost all its keys. Tenant and key are created in one transaction.
+Alternative considered: an admin endpoint with a shared secret (a public route and a master credential to attack and rotate); a seed migration (a known key in every install).
+Would flip if: public self-service signup arrives.
+
+## [2026-11-08] A tenant is one actor: no users or roles inside it yet
+Why: nothing in Phases 2–11 needs them, and every key having full tenant authority is simple to reason about. The cost is accepted and documented: a stolen key can mint more keys.
+Alternative considered: users + roles now (a large model with no caller until the dashboard); scoped keys (useful, but no second scope exists yet).
+Would flip if: the Phase 12 dashboard has multiple people in one account, or CI needs a read-only key.
+
+## [2026-11-08] Env vars: AES-256-GCM, a versioned keyring, ciphertext bound to its row with AAD, write-only through the API
+Why: the database is what's being protected against, so encryption happens in Go. Binding to tenant + project + key means ciphertext copied to another row fails to decrypt (verified, and the test goes red when the binding is removed). A version byte lets a new key be added while old rows stay readable. Values can't be read back, so one stolen key can't dump every secret. Only `Decrypted`, with no HTTP route, returns them.
+Alternative considered: `pgcrypto` (sends plaintext and key to the database); envelope encryption with per-row data keys (needs a key store to justify it, planned with KMS in Phase 14); returning values on GET (one stolen key reads everything).
+Would flip if: Phase 14 adds KMS, then envelope encryption. If users need to see non-secret config, add a per-variable flag, defaulting to write-only.
+
+## [2026-11-08] Another tenant's resource gets the same 404 as a missing one; the tenant comes only from the credential
+Why: 403 confirms an ID exists. `TestAnotherTenantsResourcesLookLikeTheyDoNotExist` compares the two responses byte for byte, so the difference can't creep back. No URL or body carries a tenant ID, and unknown JSON fields are a 400, so a caller has no way to name another tenant.
+Alternative considered: 403 (leaks existence); tenant IDs in URLs (a second source of truth to check on every route).
+Would flip if: resources can be shared across tenants, when knowing that something exists becomes legitimate.
+
+## [2026-11-08] Keyset pagination with opaque, unsigned cursors, `(created_at, id)` or the natural unique key
+Why: OFFSET reads and discards skipped rows and shifts when rows are inserted. Rows can share a timestamp, so `id` breaks ties (verified: the test goes red without it). Project names and env keys are unique in scope, so they are their own cursor. A cursor isn't signed because it grants nothing: it only positions a query already scoped to the caller's tenant. It's still decoded strictly, so bad values don't become 500s.
+Alternative considered: OFFSET; signed cursors (a key to manage, protecting nothing); `(created_at)` alone (skips ties).
+Would flip if: a cursor ever carries something the caller shouldn't choose, such as a tenant or a filter. Then sign it.
