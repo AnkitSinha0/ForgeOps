@@ -12,7 +12,9 @@ import (
 
 type EnvVarRepository interface {
 	// Set creates the variable, or replaces the value of an existing one with the
-	// same key. e.ID and e.CreatedAt come back as stored.
+	// same key. e.ID and e.CreatedAt come back as stored. If the project belongs to
+	// another tenant, it returns ErrBadReference when the key is new and ErrNotFound
+	// when the key already exists, and changes nothing either way.
 	Set(ctx context.Context, e *models.EnvVar) error
 	Get(ctx context.Context, tenantID, projectID uuid.UUID, key string) (*models.EnvVar, error)
 	// List returns the project's variables ordered by key.
@@ -31,14 +33,22 @@ func (r *envVarRepo) Set(ctx context.Context, e *models.EnvVar) error {
 	// One statement (INSERT ... ON CONFLICT DO UPDATE), not "find, then insert or
 	// update": two concurrent Sets of one key can't both insert. RETURNING hands
 	// back the id and created_at of the row that was kept.
-	err := r.db.WithContext(ctx).Clauses(
+	//
+	// The WHERE is a tenant check the foreign key can't do. On a conflict Postgres
+	// updates the existing row, tenant_id doesn't change, and the composite foreign
+	// key never runs, so without this any tenant could overwrite another tenant's
+	// variable by naming its project ID and key.
+	res := r.db.WithContext(ctx).Clauses(
 		clause.OnConflict{
 			Columns:   []clause.Column{{Name: "project_id"}, {Name: "key"}},
 			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+			Where: clause.Where{Exprs: []clause.Expression{
+				clause.Expr{SQL: "env_vars.tenant_id = EXCLUDED.tenant_id"},
+			}},
 		},
 		clause.Returning{Columns: []clause.Column{{Name: "id"}, {Name: "created_at"}}},
-	).Create(e).Error
-	return writeErr(err)
+	).Create(e)
+	return affected(res)
 }
 
 func (r *envVarRepo) Get(ctx context.Context, tenantID, projectID uuid.UUID, key string) (*models.EnvVar, error) {

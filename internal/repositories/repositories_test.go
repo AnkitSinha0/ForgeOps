@@ -280,6 +280,29 @@ func TestEnvVarSetIsUpsert(t *testing.T) {
 
 // ── domains ─────────────────────────────────────────────────────────────────
 
+// The composite foreign key does not protect an upsert. On a conflict Postgres takes
+// the DO UPDATE path against the existing row, tenant_id doesn't change, and the
+// foreign key is never rechecked. Found while planning Phase 2; this test was red
+// before the fix.
+func TestEnvVarSetCannotOverwriteAnotherTenantsVariable(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	a, b := newFixture(t, db, "acme"), newFixture(t, db, "bravo")
+	repo, ctx := NewEnvVarRepository(db), context.Background()
+
+	must(t, repo.Set(ctx, &models.EnvVar{TenantID: a.tenant.ID, ProjectID: a.project.ID, Key: "DB_PASSWORD", Value: []byte("a-secret")}))
+
+	// Tenant B names A's project and A's key, under B's own tenant ID.
+	attack := &models.EnvVar{TenantID: b.tenant.ID, ProjectID: a.project.ID, Key: "DB_PASSWORD", Value: []byte("overwritten")}
+	wantErr(t, repo.Set(ctx, attack), ErrNotFound)
+
+	got, err := repo.Get(ctx, a.tenant.ID, a.project.ID, "DB_PASSWORD")
+	must(t, err)
+	if string(got.Value) != "a-secret" {
+		t.Fatalf("tenant B overwrote tenant A's variable: value is now %q", got.Value)
+	}
+}
+
 func TestDomainHostnameUniqueAcrossTenants(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t)
