@@ -26,7 +26,7 @@ from xml.sax.saxutils import escape
 OUT = Path(__file__).resolve().parents[1] / "assets"
 
 # roadmap.svg: phases below this are drawn as done, this one pulses as next.
-CURRENT_PHASE = 2
+CURRENT_PHASE = 3
 
 FONT = "ui-sans-serif,-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,Helvetica,Arial,sans-serif"
 MONO = "ui-monospace,SFMono-Regular,'Cascadia Mono','JetBrains Mono',Menlo,Consolas,monospace"

@@ -30,6 +30,20 @@ type Tenant struct {
 
 func (t *Tenant) BeforeCreate(*gorm.DB) error { ensureID(&t.ID); return nil }
 
+// APIKey is one credential for the control plane API. A key acts as its whole
+// tenant: Phase 2 has no users or roles inside a tenant.
+type APIKey struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey"`
+	TenantID  uuid.UUID `gorm:"type:uuid"`
+	Name      string
+	Prefix    string // the key's first characters, safe to display
+	KeyHash   []byte // SHA-256 of the key; the key itself is never stored
+	CreatedAt time.Time
+	RevokedAt *time.Time
+}
+
+func (k *APIKey) BeforeCreate(*gorm.DB) error { ensureID(&k.ID); return nil }
+
 // Project is one connected Git repository.
 type Project struct {
 	ID        uuid.UUID `gorm:"type:uuid;primaryKey"`

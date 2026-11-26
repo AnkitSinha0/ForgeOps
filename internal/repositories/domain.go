@@ -2,16 +2,17 @@ package repositories
 
 import (
 	"context"
-	"strings"
 	"time"
 
+	"github.com/AnkitSinha0/forgeops/internal/hostnames"
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
 type DomainRepository interface {
-	// Create lowercases d.Hostname before inserting. A hostname taken by any
+	// Create stores d.Hostname in its canonical form (hostnames.Canonical), or
+	// returns ErrInvalid if it isn't a public hostname. A hostname taken by any
 	// tenant returns ErrConflict.
 	Create(ctx context.Context, d *models.Domain) error
 	FindByID(ctx context.Context, tenantID, id uuid.UUID) (*models.Domain, error)
@@ -27,9 +28,16 @@ var _ DomainRepository = (*domainRepo)(nil)
 func NewDomainRepository(db *gorm.DB) DomainRepository { return &domainRepo{db: db} }
 
 func (r *domainRepo) Create(ctx context.Context, d *models.Domain) error {
-	// DNS names are case-insensitive: "App.Acme.com" and "app.acme.com" are one
-	// host, so they must collide on the unique index.
-	d.Hostname = strings.ToLower(d.Hostname)
+	// A hostname is a claim that holds across every tenant, so each host must have
+	// exactly one spelling, or the unique index can be sidestepped: "App.Acme.com" and
+	// "app.acme.com." are both "app.acme.com". This sits in the repository rather than
+	// a service because it is what makes the unique index mean "one host", whoever
+	// calls Create. Migration 0003 enforces the same shape in the database.
+	host, err := hostnames.Canonical(d.Hostname)
+	if err != nil {
+		return ErrInvalid
+	}
+	d.Hostname = host
 	return writeErr(r.db.WithContext(ctx).Create(d).Error)
 }
 

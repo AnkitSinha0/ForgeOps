@@ -23,6 +23,10 @@ import (
 //go:embed sql/*.sql
 var files embed.FS
 
+// migrationLockKey is the first half of the advisory lock key: an arbitrary constant
+// that only ForgeOps migrations use ("FOMG" in ASCII).
+const migrationLockKey = 0x464F4D47
+
 // Migrate applies every migration that schema_migrations doesn't list yet.
 func Migrate(ctx context.Context, db *gorm.DB, log *zap.Logger) error {
 	names, err := fs.Glob(files, "sql/*.sql")
@@ -31,19 +35,25 @@ func Migrate(ctx context.Context, db *gorm.DB, log *zap.Logger) error {
 	}
 	sort.Strings(names) // 0001_, 0002_, ... the zero padding makes text order = numeric order
 
-	db = db.WithContext(ctx)
-	if err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
-		version    text        PRIMARY KEY,
-		applied_at timestamptz NOT NULL DEFAULT now()
-	)`).Error; err != nil {
-		return fmt.Errorf("creating schema_migrations: %w", err)
-	}
-
-	return db.Transaction(func(tx *gorm.DB) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Two controlplane replicas booting at once would both see "0001 not applied"
 		// and both run it. The lock makes the second wait, then see it applied.
-		if err := tx.Exec("LOCK TABLE schema_migrations IN EXCLUSIVE MODE").Error; err != nil {
-			return fmt.Errorf("locking schema_migrations: %w", err)
+		//
+		// It has to come before anything else, including creating schema_migrations:
+		// concurrent CREATE TABLE IF NOT EXISTS is not safe in Postgres (both pass the
+		// "if not exists" check, the loser fails on pg_type with 23505). A table lock
+		// can't guard that, because the table may not exist yet, so this is an advisory
+		// lock. The _xact_ variant is released at commit or rollback, so a crash can't
+		// leave it held. It is keyed per schema, so tests in separate schemas don't wait
+		// on each other.
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?::int4, hashtext(current_schema()))", migrationLockKey).Error; err != nil {
+			return fmt.Errorf("taking the migration lock: %w", err)
+		}
+		if err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    text        PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		)`).Error; err != nil {
+			return fmt.Errorf("creating schema_migrations: %w", err)
 		}
 		var applied []string
 		if err := tx.Raw("SELECT version FROM schema_migrations").Scan(&applied).Error; err != nil {

@@ -50,12 +50,12 @@ build:
 test:
 	go test ./... -race -count=1
 
-# Repository tests against the compose Postgres (make up first). Each test runs in
+# Every test, including those that need the compose Postgres (make up first). Each test runs in
 # its own throwaway schema, so this never touches the dev data. No -race here so it
 # also runs on Windows without gcc; `make test` covers the race detector.
 TEST_DATABASE_DSN ?= postgres://forgeops:forgeops@localhost:5433/forgeops?sslmode=disable
 test-db:
-	TEST_DATABASE_DSN="$(TEST_DATABASE_DSN)" go test ./internal/repositories/... -count=1 -v
+	TEST_DATABASE_DSN="$(TEST_DATABASE_DSN)" go test ./... -count=1
 
 vet:
 	go vet ./...

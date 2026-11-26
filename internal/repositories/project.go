@@ -2,7 +2,6 @@ package repositories
 
 import (
 	"context"
-	"time"
 
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/google/uuid"
@@ -14,8 +13,10 @@ type ProjectRepository interface {
 	Create(ctx context.Context, p *models.Project) error
 	FindByID(ctx context.Context, tenantID, id uuid.UUID) (*models.Project, error)
 	FindByName(ctx context.Context, tenantID uuid.UUID, name string) (*models.Project, error)
-	// List returns the tenant's projects ordered by name.
-	List(ctx context.Context, tenantID uuid.UUID) ([]models.Project, error)
+	// List returns the tenant's projects ordered by name, at most limit of them,
+	// starting after the name afterName ("" starts from the beginning). Names are
+	// unique within a tenant, so the name alone is a complete cursor.
+	List(ctx context.Context, tenantID uuid.UUID, afterName string, limit int) ([]models.Project, error)
 	// Update writes Name, RepoURL and Branch, including empty values.
 	Update(ctx context.Context, p *models.Project) error
 	// Delete removes the project and, by cascade, its env vars, domains, builds
@@ -51,18 +52,22 @@ func (r *projectRepo) FindByName(ctx context.Context, tenantID uuid.UUID, name s
 	return &p, nil
 }
 
-func (r *projectRepo) List(ctx context.Context, tenantID uuid.UUID) ([]models.Project, error) {
+func (r *projectRepo) List(ctx context.Context, tenantID uuid.UUID, afterName string, limit int) ([]models.Project, error) {
 	var ps []models.Project
+	q := r.db.WithContext(ctx).Where("tenant_id = ?", tenantID)
+	if afterName != "" {
+		q = q.Where("name > ?", afterName)
+	}
 	// Always an explicit ORDER BY: without one, row order is whatever the
 	// database's plan happens to produce, and it changes between runs.
-	err := r.db.WithContext(ctx).Where("tenant_id = ?", tenantID).Order("name").Find(&ps).Error
+	err := q.Order("name").Limit(limit).Find(&ps).Error
 	return ps, writeErr(err)
 }
 
 func (r *projectRepo) Update(ctx context.Context, p *models.Project) error {
 	// A map, not Updates(p): with a struct, GORM silently skips zero values, so
 	// clearing a field would be ignored without an error.
-	now := time.Now()
+	now := r.db.NowFunc()
 	res := r.db.WithContext(ctx).Model(&models.Project{}).
 		Where("tenant_id = ? AND id = ?", p.TenantID, p.ID).
 		Updates(map[string]any{"name": p.Name, "repo_url": p.RepoURL, "branch": p.Branch, "updated_at": now})

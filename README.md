@@ -8,7 +8,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?style=flat-square&logo=postgresql&logoColor=white)](#tech-stack)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?style=flat-square&logo=redis&logoColor=white)](#tech-stack)
 [![Sandbox](https://img.shields.io/badge/sandbox-gVisor%20runsc-f97316?style=flat-square)](#security-model)
-[![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20phases%200%E2%80%931%20of%2014%20done-f59e0b?style=flat-square)](#roadmap)
+[![Status](https://img.shields.io/badge/status-pre--alpha%20%C2%B7%20phases%200%E2%80%932%20of%2014%20done-f59e0b?style=flat-square)](#roadmap)
 
 **Push to a Git repo. Get a live HTTPS URL. Safely.**<br>
 ForgeOps builds every commit in a gVisor sandbox, deploys it as an immutable container behind a dynamic router,<br>
@@ -21,7 +21,7 @@ and rolls back with a single registry write. Written in Go, self-hostable with D
 ---
 
 > [!IMPORTANT]
-> **ForgeOps has finished Phases 0–1 of 14 (0–13).** The three services boot, serve health probes and shut down cleanly; the data model is migrated and its repositories are tested against real Postgres, tenant isolation included. Nothing builds or deploys yet.
+> **ForgeOps has finished Phases 0–2 of 14 (0–13).** The three services boot, serve health probes and shut down cleanly; the control plane has an authenticated, tenant-isolated API for projects and encrypted env vars, tested against real Postgres. Nothing builds or deploys yet.
 > The diagrams show the target design, and every feature names the phase that delivers it. This README is updated as phases land, and it never presents something that doesn't run yet as if it did.
 
 ## Why ForgeOps
@@ -39,7 +39,9 @@ Most "mini-Heroku" projects stop at "it deploys". ForgeOps is built around the h
 | Capability | What it means | Phase |
 |---|---|:-:|
 | **Health and graceful shutdown** | Liveness and readiness are separate probes; SIGTERM drains in-flight requests | 0 (done) |
-| **Tenant-scoped data layer** | Every query is scoped by tenant, backed by composite foreign keys; secrets encrypted at rest in Phase 2 | 1 (done), 2 |
+| **Tenant-scoped data layer** | Every query is scoped by tenant, backed by composite foreign keys | 1 (done) |
+| **Authenticated API** | Per-tenant API keys stored only as hashes; another tenant's resource is indistinguishable from a missing one | 2 (done) |
+| **Encrypted env vars** | AES-256-GCM, bound to the row so ciphertext can't be moved; values are write-only through the API | 2 (done) |
 | **Signed webhooks** | GitHub `X-Hub-Signature-256` HMAC is verified before anything is queued; `go-git` clones the exact commit | 3 |
 | **Build queue** | Redis-backed queue with atomic claims; per-build timeout and memory limit | 4 |
 | **Dynamic routing + auto TLS** | `httputil.ReverseProxy` driven by a Redis registry, certificates from ACME | 5 |
@@ -171,7 +173,7 @@ erDiagram
     BUILD }o--o{ BUILD_LAYER : "made of (ref-counted)"
 ```
 
-This is the Phase 1 schema ([`0001_init.sql`](internal/migrations/sql/0001_init.sql)). Every tenant-owned table carries `tenant_id` and points at its parent through a **composite foreign key** `(tenant_id, parent_id)`, so the database itself refuses a row that mixes two tenants. Every repository method takes a `tenantID`. Build layers are global and content-addressed; a layer's reference count is the number of builds pointing at it, and the database refuses to delete a layer still in use.
+This is the Phase 1 schema ([`0001_init.sql`](internal/migrations/sql/0001_init.sql)). Every tenant-owned table carries `tenant_id` and points at its parent through a **composite foreign key** `(tenant_id, parent_id)`, so the database itself refuses an inserted row that mixes two tenants. A foreign key doesn't run on an upsert's update path, so the env var upsert carries its own tenant check. Every repository method takes a `tenantID`. Build layers are global and content-addressed; a layer's reference count is the number of builds pointing at it, and the database refuses to delete a layer still in use.
 
 ## Testing and reliability
 
@@ -189,7 +191,7 @@ Everything will be reproducible with `make loadtest` and `make chaostest`.
 
 ## Roadmap
 
-<img src="docs/assets/roadmap.svg" alt="Fourteen phases from foundation to a self-hostable release; Phase 0 is done, Phase 1 is next, Phase 6 is the centrepiece" width="100%">
+<img src="docs/assets/roadmap.svg" alt="Fourteen phases from foundation to a self-hostable release; Phases 0 to 2 are done, Phase 3 is next, Phase 6 is the centrepiece" width="100%">
 
 Each phase ends with something runnable and a check that actually runs.
 
@@ -197,8 +199,8 @@ Each phase ends with something runnable and a check that actually runs.
 |:-:|---|---|---|
 | 0 | Foundation | Three services start, connect to infra, pass probes, drain on SIGTERM | **done** |
 | 1 | Domain model and repositories | The schema migrates and every repository passes CRUD tests | **done** |
-| 2 | Control plane API, auth, tenancy | Create a project, set env vars and list deployments with `curl`; cross-tenant reads fail | next |
-| 3 | Git integration | A push to a connected repo clones the exact commit; a bad signature gets a 401 | planned |
+| 2 | Control plane API, auth, tenancy | Create a project, set env vars and list deployments with `curl`; cross-tenant reads fail | **done** |
+| 3 | Git integration | A push to a connected repo clones the exact commit; a bad signature gets a 401 | next |
 | 4 | Build executor | Push → build in a container → image; a build over its limit is killed cleanly | planned |
 | 5 | Deploy, router, TLS | Push to main → live on HTTPS in seconds → one-click rollback | planned |
 | 6 | **gVisor isolation** | Builds run under `runsc`; the hostile repo's escape attempts are all contained | planned |
@@ -233,6 +235,7 @@ These commands work today.
 ```bash
 git clone https://github.com/AnkitSinha0/ForgeOps.git && cd ForgeOps
 cp .env.example .env
+echo "SECRETS_KEYS=1:$(openssl rand -base64 32)" >> .env   # encrypts env vars; the controlplane won't boot without it
 make up                 # Postgres 17, Redis 7, MinIO; waits until all are healthy
 
 make run-controlplane   # terminal 1
@@ -259,8 +262,23 @@ curl -i localhost:8082/readyz    # 200 again, with no service restart
 
 On first boot the controlplane applies the schema (`applied migration {"version": "0001_init"}`); later boots skip it.
 
+Now use the API. `go run` keeps its logs on stderr, so only the key lands in the variable:
+
 ```bash
-make test-db                     # 10 repository tests against real Postgres, tenant isolation included
+KEY=$(go run ./cmd/controlplane admin create-tenant --name "Acme Inc" --slug acme)
+AUTH="Authorization: Bearer $KEY"; JSON="Content-Type: application/json"
+
+curl -i localhost:8080/v1/projects               # with no key: 401
+PROJECT=$(curl -s -H "$AUTH" -H "$JSON" -d '{"name":"web","repo_url":"https://github.com/acme/web"}' \
+  localhost:8080/v1/projects | sed 's/.*"id":"\([^"]*\)".*/\1/')
+curl -X PUT -H "$AUTH" -H "$JSON" -d '{"value":"hunter2"}' \
+  localhost:8080/v1/projects/$PROJECT/env/DB_PASSWORD      # stored encrypted; the response has no value
+curl -H "$AUTH" localhost:8080/v1/projects/$PROJECT/env    # keys and timestamps, never values
+curl -H "$AUTH" localhost:8080/v1/projects/$PROJECT/deployments   # {"items":[],"next_cursor":null} until Phases 3-5
+```
+
+```bash
+make test-db                     # every test against real Postgres, including tenant isolation
 ```
 
 Press Ctrl+C in a service's terminal to stop it gracefully. `make down` stops the infrastructure, and `make reset` deletes its volumes too.
@@ -322,13 +340,18 @@ internal/
   migrations/          versioned SQL (embedded) + a runner that applies it once, in one transaction
   models/              rows as Go structs, UUIDv4 IDs, status state machines
   repositories/        tenant-scoped data access, sentinel errors, integration tests
+  apikey/              key generation and hashing
+  secrets/             AES-256-GCM with a versioned keyring
+  services/            validation, encryption, pagination; no HTTP
+  handlers/            routes, middleware, auth, one place errors become responses
+  testdb/              a private Postgres schema per test
 pkg/
   logger/              zap logger tagged with the service name
 deploy/                docker-compose.yml for local infrastructure
 docs/diagrams/         build.py, the source of every diagram in this README
 ```
 
-Planned packages, added in the phase that needs them: `services`, `handlers` (2), `git` (3), `queue`, `builder`, `sandbox` (4–6), `router` (5), `cache` (7), `logstream` (8), `observability` (10), plus `web/` (12) and `loadtest/` (11).
+Planned packages, added in the phase that needs them: `git` (3), `queue`, `builder`, `sandbox` (4–6), `router` (5), `cache` (7), `logstream` (8), `observability` (10), plus `web/` (12) and `loadtest/` (11).
 
 ## Engineering approach
 
