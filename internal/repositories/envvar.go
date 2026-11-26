@@ -15,6 +15,11 @@ type EnvVarRepository interface {
 	// another tenant, it returns ErrBadReference when the key is new and ErrNotFound
 	// when the key already exists, and changes nothing either way.
 	Set(ctx context.Context, e *models.EnvVar) error
+	// SetWithin is Set, refused with ErrLimitReached if afterwards the project would
+	// hold more than lim.MaxVars variables or more than lim.MaxBytes of stored values.
+	// Replacing a variable counts its new size, not old plus new. A project that is
+	// not the tenant's returns ErrNotFound.
+	SetWithin(ctx context.Context, e *models.EnvVar, lim EnvVarLimits) error
 	Get(ctx context.Context, tenantID, projectID uuid.UUID, key string) (*models.EnvVar, error)
 	// List returns all of the project's variables with their values, ordered by key.
 	List(ctx context.Context, tenantID, projectID uuid.UUID) ([]models.EnvVar, error)
@@ -31,10 +36,53 @@ var _ EnvVarRepository = (*envVarRepo)(nil)
 
 func NewEnvVarRepository(db *gorm.DB) EnvVarRepository { return &envVarRepo{db: db} }
 
+// EnvVarLimits bounds one project's variables. MaxBytes counts what is stored, so
+// with encryption that is each value plus 29 bytes (version, nonce and tag).
+type EnvVarLimits struct {
+	MaxVars  int
+	MaxBytes int64
+}
+
 func (r *envVarRepo) Set(ctx context.Context, e *models.EnvVar) error {
+	return upsertEnvVar(r.db.WithContext(ctx), e)
+}
+
+func (r *envVarRepo) SetWithin(ctx context.Context, e *models.EnvVar, lim EnvVarLimits) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Locking the project row makes Sets on one project take turns. Without it,
+		// two concurrent Sets could each count 199 variables and both insert. Other
+		// projects aren't blocked. The lock is tenant-scoped like every other read,
+		// so another tenant's project is simply not found.
+		var locked []uuid.UUID
+		if err := tx.Raw("SELECT id FROM projects WHERE tenant_id = ? AND id = ? FOR UPDATE",
+			e.TenantID, e.ProjectID).Scan(&locked).Error; err != nil {
+			return writeErr(err)
+		}
+		if len(locked) == 0 {
+			return ErrNotFound
+		}
+		var usage struct {
+			Vars  int
+			Bytes int64
+		}
+		// Every other variable of the project: the one being set is replaced, so only
+		// its new size counts.
+		if err := tx.Raw(`SELECT count(*) AS vars, coalesce(sum(octet_length(value)), 0) AS bytes
+			FROM env_vars WHERE tenant_id = ? AND project_id = ? AND key <> ?`,
+			e.TenantID, e.ProjectID, e.Key).Scan(&usage).Error; err != nil {
+			return writeErr(err)
+		}
+		if usage.Vars+1 > lim.MaxVars || usage.Bytes+int64(len(e.Value)) > lim.MaxBytes {
+			return ErrLimitReached
+		}
+		return upsertEnvVar(tx, e)
+	})
+}
+
+func upsertEnvVar(db *gorm.DB, e *models.EnvVar) error {
 	// One clock reading for both, so a new row can't have updated_at before created_at.
 	// On a conflict the existing created_at is kept, and RETURNING hands it back.
-	now := r.db.NowFunc()
+	now := db.NowFunc()
 	e.CreatedAt, e.UpdatedAt = now, now
 	// One statement (INSERT ... ON CONFLICT DO UPDATE), not "find, then insert or
 	// update": two concurrent Sets of one key can't both insert. RETURNING hands
@@ -44,7 +92,7 @@ func (r *envVarRepo) Set(ctx context.Context, e *models.EnvVar) error {
 	// updates the existing row, tenant_id doesn't change, and the composite foreign
 	// key never runs, so without this any tenant could overwrite another tenant's
 	// variable by naming its project ID and key.
-	res := r.db.WithContext(ctx).Clauses(
+	res := db.Clauses(
 		clause.OnConflict{
 			Columns:   []clause.Column{{Name: "project_id"}, {Name: "key"}},
 			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),

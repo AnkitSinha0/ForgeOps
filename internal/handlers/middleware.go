@@ -142,8 +142,15 @@ func (h *handler) authenticate(next http.Handler) http.Handler {
 	})
 }
 
+// bearerToken refuses a request with more than one Authorization header. Header.Get
+// reads only the first, and a proxy in front may read another (or join them), so the
+// two layers could disagree about who is calling. One credential per request.
 func bearerToken(r *http.Request) (string, bool) {
-	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return "", false
+	}
+	scheme, token, ok := strings.Cut(values[0], " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
 		return "", false
 	}

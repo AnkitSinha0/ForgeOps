@@ -22,6 +22,10 @@ import (
 // of 64 KiB, which JSON escaping can inflate to several times that size.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
+// maxEchoedField is the longest unknown field name an error message repeats back.
+// It counts the quotes encoding/json puts around the name.
+const maxEchoedField = 66
+
 // errorBody is the one shape every error response has.
 type errorBody struct {
 	Error errorDetail `json:"error"`
@@ -124,6 +128,12 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 			return &requestError{http.StatusRequestEntityTooLarge, "body_too_large", "the request body is too large"}
 		}
 		if field, ok := strings.CutPrefix(err.Error(), "json: unknown field "); ok {
+			// Naming the field helps a client fix "tenant_id" or a typo, but the name is
+			// the caller's own input: echoed in full, a 1 MiB field name came back as a
+			// 1 MiB error. Long names aren't real fields, so they aren't quoted.
+			if len(field) > maxEchoedField {
+				return &requestError{http.StatusBadRequest, "invalid_request", "the body has an unknown field"}
+			}
 			return &requestError{http.StatusBadRequest, "invalid_request", "unknown field " + field}
 		}
 		return &requestError{http.StatusBadRequest, "invalid_request", "the request body is not valid JSON for this endpoint"}
@@ -176,9 +186,14 @@ func envKeyParam(r *http.Request) string {
 
 // parseID reads a UUID from the path. A malformed ID can't name any row, so it gets
 // the same 404 as an ID that doesn't exist.
+//
+// Only the canonical spelling (lowercase, hyphenated, as the API returns it) counts.
+// uuid.Parse also takes uppercase, {braces}, urn:uuid: and no hyphens, which would
+// give one resource five URLs, and anything keyed on the path, such as a rate limit
+// or a cache, could be sidestepped by switching spelling.
 func parseID(text string) (uuid.UUID, error) {
 	id, err := uuid.Parse(text)
-	if err != nil {
+	if err != nil || id.String() != text {
 		return uuid.Nil, services.ErrNotFound
 	}
 	return id, nil

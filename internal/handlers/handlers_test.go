@@ -748,7 +748,15 @@ func TestPaginationCoversEveryRowOnce(t *testing.T) {
 	// Deployments, all with one timestamp: the case a timestamp-only cursor gets wrong.
 	projectID := uuid.MustParse(project)
 	build := &models.Build{TenantID: tenantID, ProjectID: projectID, CommitSHA: strings.Repeat("a", 40), Branch: "main"}
-	if err := repositories.NewBuildRepository(a.db).Create(ctx, build); err != nil {
+	builds := repositories.NewBuildRepository(a.db)
+	if err := builds.Create(ctx, build); err != nil {
+		t.Fatal(err)
+	}
+	// Only a build with an image can be deployed (security audit 2026-11-11).
+	if err := builds.MarkBuilding(ctx, tenantID, build.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := builds.MarkSucceeded(ctx, tenantID, build.ID, "registry.local/acme/web:aaaa"); err != nil {
 		t.Fatal(err)
 	}
 	same := time.Now().UTC().Truncate(time.Microsecond)

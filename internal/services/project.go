@@ -6,7 +6,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/AnkitSinha0/forgeops/internal/hostnames"
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/AnkitSinha0/forgeops/internal/repositories"
 	"github.com/google/uuid"
@@ -99,13 +102,26 @@ func checkProject(in ProjectInput) error {
 // because that depends on DNS at clone time: Phase 3 has to check that when it clones.
 func checkRepoURL(raw string) error {
 	const message = "must be an https URL with no credentials, query or fragment"
-	if raw == "" || len(raw) > 2048 || strings.ContainsAny(raw, " \t\r\n") {
+	if raw == "" || len(raw) > 2048 || strings.ContainsFunc(raw, unsafeInURL) {
 		return invalid("repo_url", message)
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
-		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.HasSuffix(raw, "#") {
 		return invalid("repo_url", message)
+	}
+	// The path is checked again decoded: "%00" is three harmless bytes in raw but a NUL
+	// once a git client unescapes it.
+	if strings.ContainsFunc(u.Path, unsafeInURL) {
+		return invalid("repo_url", message)
+	}
+	// The host has to be a public DNS name. IP literals, localhost and single-label
+	// names are refused here because they are visibly internal (127.0.0.1, the cloud
+	// metadata address 169.254.169.254, "gitlab" on a private network). A public name
+	// can still resolve to an internal address, so Phase 3 checks the resolved address
+	// at clone time as well: this is the cheap first filter, not the whole defence.
+	if _, err := hostnames.Canonical(u.Hostname()); err != nil {
+		return invalid("repo_url", "must use a public hostname, not an IP address, localhost or a single-label name")
 	}
 	// url.Parse only checks that a port is digits, so 99999999 gets through it.
 	if p := u.Port(); p != "" {
@@ -116,13 +132,28 @@ func checkRepoURL(raw string) error {
 	return nil
 }
 
+// unsafeInURL: whitespace, controls (including C1 such as U+0085), formatting
+// characters such as bidi overrides (which make a URL display as something it
+// isn't), and NUL.
+func unsafeInURL(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == utf8.RuneError
+}
+
 var branchPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$`)
 
 // checkBranch is stricter than git's own rules on purpose. Not starting with "-" also
-// means the value can never be read as a command-line option.
+// means the value can never be read as a command-line option. On top of the pattern it
+// applies git check-ref-format's rules per component: none may start with "." or end
+// with ".lock", and "HEAD" is git's name for the current commit, not a branch.
 func checkBranch(branch string) error {
-	if !branchPattern.MatchString(branch) || strings.Contains(branch, "..") || strings.Contains(branch, "//") ||
-		strings.HasSuffix(branch, "/") || strings.HasSuffix(branch, ".") || strings.HasSuffix(branch, ".lock") {
+	bad := !branchPattern.MatchString(branch) || strings.Contains(branch, "..") || strings.Contains(branch, "//") ||
+		strings.HasSuffix(branch, "/") || strings.HasSuffix(branch, ".") || branch == "HEAD"
+	for part := range strings.SplitSeq(branch, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			bad = true
+		}
+	}
+	if bad {
 		return invalid("branch", "is not a valid branch name")
 	}
 	return nil

@@ -55,6 +55,10 @@ func Serve(ctx context.Context, name string, srv *http.Server, shutdownTimeout t
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		// The drain ran out of time. Shutdown has stopped new connections but leaves
+		// the slow ones open, and a handler that ignores its context would go on
+		// answering after "shutdown". Close cuts them, so the deadline is a deadline.
+		_ = srv.Close()
 		return fmt.Errorf("%s listener shutdown: %w", name, err)
 	}
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {

@@ -125,6 +125,15 @@ func pageOf[T any](rows []T, limit int, cursor func(T) string) Page[T] {
 // checkLabel validates free text shown to people, such as tenant and key names.
 // Control characters are refused because Postgres can't store a NUL byte in text, and
 // the failure would otherwise surface as a 500.
+// invisible reports characters that change how a label looks without being seen:
+// controls (Cc), and formatting characters (Cf) such as zero-width spaces, the BOM and
+// the bidi overrides that can make "yek-ic" display as "ci-key". U+FFFD is refused too:
+// it is what the JSON decoder puts in place of invalid UTF-16, so the caller sent
+// something other than what will be stored.
+func invisible(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == utf8.RuneError
+}
+
 func checkLabel(field, value string) error {
 	if strings.TrimSpace(value) == "" {
 		return invalid(field, "is required")
@@ -132,8 +141,8 @@ func checkLabel(field, value string) error {
 	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 100 {
 		return invalid(field, "must be valid text of at most 100 characters")
 	}
-	if strings.ContainsFunc(value, unicode.IsControl) {
-		return invalid(field, "must not contain control characters")
+	if strings.ContainsFunc(value, invisible) {
+		return invalid(field, "must not contain control, formatting or invisible characters")
 	}
 	return nil
 }

@@ -129,8 +129,44 @@ func Load() (*Config, error) {
 	if cfg.App.ShutdownTimeout <= 0 {
 		return nil, fmt.Errorf("APP_SHUTDOWN_TIMEOUT must be positive, got %s", cfg.App.ShutdownTimeout)
 	}
+	if err := cfg.Database.check(); err != nil {
+		return nil, err
+	}
+	if cfg.IsProduction() {
+		if err := cfg.checkProduction(); err != nil {
+			return nil, err
+		}
+	}
 
 	return cfg, nil
+}
+
+// check rejects pool settings database/sql would accept but misread: 0 open
+// connections means "unlimited", not "none", and a negative lifetime means "forever".
+func (d DatabaseConfig) check() error {
+	if d.MaxOpenConns < 1 {
+		return fmt.Errorf("DATABASE_MAX_OPEN_CONNS must be at least 1, got %d", d.MaxOpenConns)
+	}
+	if d.MaxIdleConns < 0 || d.MaxIdleConns > d.MaxOpenConns {
+		return fmt.Errorf("DATABASE_MAX_IDLE_CONNS must be between 0 and DATABASE_MAX_OPEN_CONNS (%d), got %d", d.MaxOpenConns, d.MaxIdleConns)
+	}
+	if d.ConnMaxLifetime < 0 {
+		return fmt.Errorf("DATABASE_CONN_MAX_LIFETIME must not be negative, got %s", d.ConnMaxLifetime)
+	}
+	return nil
+}
+
+// checkProduction refuses the two local-dev shortcuts that must never reach a real
+// deployment: Postgres without TLS, and Redis without a password. (Errors name the
+// setting, never its value: the DSN holds a password.)
+func (c *Config) checkProduction() error {
+	if strings.Contains(strings.ToLower(c.Database.DSN), "sslmode=disable") {
+		return errors.New("APP_ENV=production: DATABASE_DSN must not use sslmode=disable; use sslmode=verify-full")
+	}
+	if c.Redis.Password == "" {
+		return errors.New("APP_ENV=production: REDIS_PASSWORD is required")
+	}
+	return nil
 }
 
 func (c *Config) IsProduction() bool {

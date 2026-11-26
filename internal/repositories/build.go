@@ -2,7 +2,8 @@ package repositories
 
 import (
 	"context"
-	"time"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/google/uuid"
@@ -58,21 +59,47 @@ func (r *buildRepo) ListByProject(ctx context.Context, tenantID, projectID uuid.
 }
 
 func (r *buildRepo) MarkBuilding(ctx context.Context, tenantID, id uuid.UUID) error {
-	now := time.Now()
+	now := r.db.NowFunc()
 	return r.transition(ctx, tenantID, id, []models.BuildStatus{models.BuildQueued},
 		map[string]any{"status": models.BuildBuilding, "started_at": now, "updated_at": now})
 }
 
+// MarkSucceeded refuses an empty image: "succeeded" is what makes a build deployable,
+// and a deployment of nothing would fail far from the cause. Migration 0003 enforces
+// the same rule in the database.
 func (r *buildRepo) MarkSucceeded(ctx context.Context, tenantID, id uuid.UUID, imageRef string) error {
-	now := time.Now()
+	if strings.TrimSpace(imageRef) == "" {
+		return ErrInvalid
+	}
+	now := r.db.NowFunc()
 	return r.transition(ctx, tenantID, id, []models.BuildStatus{models.BuildBuilding},
 		map[string]any{"status": models.BuildSucceeded, "image_ref": imageRef, "finished_at": now, "updated_at": now})
 }
 
+// maxBuildErrorBytes bounds a stored failure reason. Reasons come from build output,
+// which a tenant controls.
+const maxBuildErrorBytes = 4096
+
+// MarkFailed never refuses a reason: an executor reporting a failure must always be
+// able to record it, or the build would sit in "building" forever. So the reason is
+// cleaned instead: NUL bytes (which Postgres text can't hold) are dropped and the
+// rest is cut to maxBuildErrorBytes on a UTF-8 boundary.
 func (r *buildRepo) MarkFailed(ctx context.Context, tenantID, id uuid.UUID, reason string) error {
-	now := time.Now()
+	now := r.db.NowFunc()
 	return r.transition(ctx, tenantID, id, []models.BuildStatus{models.BuildQueued, models.BuildBuilding},
-		map[string]any{"status": models.BuildFailed, "error": reason, "finished_at": now, "updated_at": now})
+		map[string]any{"status": models.BuildFailed, "error": boundedReason(reason), "finished_at": now, "updated_at": now})
+}
+
+func boundedReason(s string) string {
+	s = strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", ""), "�")
+	if len(s) <= maxBuildErrorBytes {
+		return s
+	}
+	cut := maxBuildErrorBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // transition applies set only if the build is currently in one of from.

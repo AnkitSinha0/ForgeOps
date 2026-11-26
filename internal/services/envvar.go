@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/AnkitSinha0/forgeops/internal/repositories"
@@ -15,8 +16,43 @@ import (
 
 const maxEnvValueBytes = 64 << 10 // 64 KiB
 
+// envLimits bound one project's variables, sized against where they end up: the
+// environment of a process started with execve, whose arguments and environment
+// together are capped (2 MiB on a default Linux stack, less with the args added).
+// 512 KiB leaves the platform and the app's own arguments plenty of room.
+var envLimits = repositories.EnvVarLimits{MaxVars: 200, MaxBytes: 512 << 10}
+
 // envKeyPattern matches the CHECK on env_vars.key in 0001_init.sql, plus a length limit.
 var envKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,255}$`)
+
+// Names a tenant may not set. They are compared in uppercase: Linux treats PATH and
+// path as two variables, but Windows containers and many tools don't.
+//   - The loader's own variables (LD_*, DYLD_*): they decide what code runs before main.
+//   - What the platform sets for every app (PORT from Phase 5, FORGEOPS_*): a tenant
+//     value would either be overwritten silently or, if the executor ever applied
+//     tenant values last, override the platform.
+//   - PATH, HOME, HOSTNAME: set by the image and the runtime; overriding them breaks
+//     the container in ways that look like platform bugs.
+//
+// This guards the tenant's own container from surprises and keeps the platform's
+// names the platform's. It is not the isolation boundary: Phase 6's sandbox is.
+var (
+	reservedEnvNames    = []string{"PATH", "HOME", "HOSTNAME", "PORT"}
+	reservedEnvPrefixes = []string{"LD_", "DYLD_", "FORGEOPS_"}
+)
+
+func reservedEnvName(key string) bool {
+	upper := strings.ToUpper(key)
+	if slices.Contains(reservedEnvNames, upper) {
+		return true
+	}
+	for _, p := range reservedEnvPrefixes {
+		if strings.HasPrefix(upper, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // EnvVarService stores environment variables encrypted. Values go in through Set and
 // are never returned by the API. The only way out is Decrypted, for the executor.
@@ -44,17 +80,30 @@ func (s *EnvVarService) Set(ctx context.Context, tenantID, projectID uuid.UUID, 
 	if !envKeyPattern.MatchString(key) {
 		return nil, invalid("key", "must be letters, digits and underscores, up to 256 characters, not starting with a digit")
 	}
+	if reservedEnvName(key) {
+		return nil, invalid("key", "is reserved for the platform (PATH, HOME, HOSTNAME, PORT, LD_*, DYLD_*, FORGEOPS_*)")
+	}
 	if len(value) > maxEnvValueBytes {
 		return nil, invalid("value", fmt.Sprintf("must be at most %d bytes", maxEnvValueBytes))
+	}
+	// execve takes C strings, so a NUL would silently cut the value short. Newlines are
+	// fine (certificates, keys): the executor passes values as a list, never through a
+	// shell or an env-file, where a newline would start a new variable.
+	if strings.ContainsRune(value, 0) {
+		return nil, invalid("value", "must not contain a NUL byte")
 	}
 	sealed, err := s.keys.Seal([]byte(value), boundTo(tenantID, projectID, key))
 	if err != nil {
 		return nil, fmt.Errorf("encrypting value: %w", err)
 	}
 	e := &models.EnvVar{TenantID: tenantID, ProjectID: projectID, Key: key, Value: sealed}
-	if err := s.envVars.Set(ctx, e); err != nil {
-		if errors.Is(err, repositories.ErrBadReference) {
+	if err := s.envVars.SetWithin(ctx, e, envLimits); err != nil {
+		switch {
+		case errors.Is(err, repositories.ErrBadReference):
 			return nil, ErrNotFound
+		case errors.Is(err, repositories.ErrLimitReached):
+			return nil, invalid("key", fmt.Sprintf("a project holds at most %d variables and %d KiB of values in total",
+				envLimits.MaxVars, envLimits.MaxBytes>>10))
 		}
 		return nil, err
 	}

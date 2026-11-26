@@ -58,6 +58,16 @@ func newFixture(t *testing.T, db *gorm.DB, slug string) fixture {
 
 func digest(n int) string { return fmt.Sprintf("sha256:%064x", n) }
 
+// deployable takes the fixture's build through to succeeded: only a build with an
+// image can be deployed (security audit 2026-11-11).
+func (f fixture) deployable(t *testing.T, db *gorm.DB) fixture {
+	t.Helper()
+	ctx, builds := context.Background(), NewBuildRepository(db)
+	must(t, builds.MarkBuilding(ctx, f.tenant.ID, f.build.ID))
+	must(t, builds.MarkSucceeded(ctx, f.tenant.ID, f.build.ID, "registry.local/"+f.tenant.Slug+"/web:aaaa"))
+	return f
+}
+
 // ── migrations ──────────────────────────────────────────────────────────────
 
 func TestMigrateIsIdempotent(t *testing.T) {
@@ -143,7 +153,7 @@ func TestDeploymentPagesCoverEveryRowWhenTimestampsTie(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t)
 	ctx := context.Background()
-	f := newFixture(t, db, "acme")
+	f := newFixture(t, db, "acme").deployable(t, db)
 	repo := NewDeploymentRepository(db)
 
 	same := time.Now().UTC().Truncate(time.Microsecond)
@@ -460,7 +470,7 @@ func TestDeploymentOneLivePerProjectAndRollback(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t)
 	ctx := context.Background()
-	f := newFixture(t, db, "acme")
+	f := newFixture(t, db, "acme").deployable(t, db)
 	repo := NewDeploymentRepository(db)
 	tid := f.tenant.ID
 
@@ -568,7 +578,7 @@ func TestProjectDeleteCascades(t *testing.T) {
 	t.Parallel()
 	db := newTestDB(t)
 	ctx := context.Background()
-	f := newFixture(t, db, "acme")
+	f := newFixture(t, db, "acme").deployable(t, db)
 	must(t, NewEnvVarRepository(db).Set(ctx, &models.EnvVar{TenantID: f.tenant.ID, ProjectID: f.project.ID, Key: "SECRET", Value: []byte("s")}))
 	must(t, NewDomainRepository(db).Create(ctx, &models.Domain{TenantID: f.tenant.ID, ProjectID: f.project.ID, Hostname: "acme.example"}))
 	must(t, NewDeploymentRepository(db).Create(ctx, &models.Deployment{TenantID: f.tenant.ID, ProjectID: f.project.ID, BuildID: f.build.ID}))

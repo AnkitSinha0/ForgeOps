@@ -2,7 +2,7 @@ package repositories
 
 import (
 	"context"
-	"time"
+	"errors"
 
 	"github.com/AnkitSinha0/forgeops/internal/models"
 	"github.com/google/uuid"
@@ -11,7 +11,8 @@ import (
 
 type DeploymentRepository interface {
 	// Create inserts d with status pending. d.BuildID must be a build of
-	// d.ProjectID in d.TenantID, or the result is ErrBadReference.
+	// d.ProjectID in d.TenantID, or the result is ErrBadReference, and that build
+	// must have succeeded, or the result is ErrInvalid.
 	Create(ctx context.Context, d *models.Deployment) error
 	FindByID(ctx context.Context, tenantID, id uuid.UUID) (*models.Deployment, error)
 	// ListByProject returns the newest deployments first, at most limit of them,
@@ -31,6 +32,23 @@ func NewDeploymentRepository(db *gorm.DB) DeploymentRepository { return &deploym
 
 func (r *deploymentRepo) Create(ctx context.Context, d *models.Deployment) error {
 	d.Status = models.DeploymentPending
+	// Only a build that produced an image can be deployed. Checking first and then
+	// inserting can't race: succeeded is a terminal status, so once seen it stays.
+	// The lookup is tenant-scoped, so another tenant's build reads as a bad
+	// reference, the same answer the composite foreign key gives.
+	var build models.Build
+	err := r.db.WithContext(ctx).Select("status").
+		Where("tenant_id = ? AND project_id = ? AND id = ?", d.TenantID, d.ProjectID, d.BuildID).
+		Take(&build).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrBadReference
+	}
+	if err != nil {
+		return writeErr(err)
+	}
+	if build.Status != models.BuildSucceeded {
+		return ErrInvalid
+	}
 	return writeErr(r.db.WithContext(ctx).Create(d).Error)
 }
 
@@ -56,7 +74,7 @@ func (r *deploymentRepo) SetStatus(ctx context.Context, tenantID, id uuid.UUID, 
 	}
 	res := r.db.WithContext(ctx).Model(&models.Deployment{}).
 		Where("tenant_id = ? AND id = ? AND status IN ?", tenantID, id, from).
-		Updates(map[string]any{"status": status, "updated_at": time.Now()})
+		Updates(map[string]any{"status": status, "updated_at": r.db.NowFunc()})
 	if res.Error != nil {
 		return writeErr(res.Error) // the one-live-per-project index → ErrConflict
 	}

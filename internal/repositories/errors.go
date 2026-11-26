@@ -32,6 +32,9 @@ var (
 	ErrInvalidTransition = errors.New("invalid status transition")
 	// ErrInUse: the row can't be deleted while other rows still reference it.
 	ErrInUse = errors.New("record is still referenced")
+	// ErrLimitReached: the write would take a parent past a size or count limit
+	// (e.g. too many env vars in one project).
+	ErrLimitReached = errors.New("limit reached")
 )
 
 // Postgres SQLSTATE codes we translate. https://www.postgresql.org/docs/current/errcodes-appendix.html

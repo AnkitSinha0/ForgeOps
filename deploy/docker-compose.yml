@@ -3,6 +3,11 @@
 #
 # Host ports are shifted (+1) from the defaults so this stack can run alongside
 # HashVault's compose stack, which already owns 5432 / 6379 / 9000.
+#
+# DEV ONLY. The credentials below are public (they are in this file) and Redis has no
+# password. Every port is therefore published on 127.0.0.1 only: "5433:5432" would
+# listen on every interface, putting the database on the LAN, or on the internet on a
+# cloud VM. Production refuses these defaults (config.checkProduction).
 
 name: forgeops # without this, Compose names the project after the folder ("deploy")
 
@@ -14,7 +19,7 @@ services:
       POSTGRES_PASSWORD: forgeops
       POSTGRES_DB: forgeops
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -29,7 +34,7 @@ services:
     # build queue (Phase 4) or the router registry (Phase 5).
     command: redis-server --appendonly yes
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -49,8 +54,8 @@ services:
       MINIO_ROOT_USER: forgeops
       MINIO_ROOT_PASSWORD: forgeops-secret
     ports:
-      - "9010:9000" # S3 API
-      - "9011:9001" # web console
+      - "127.0.0.1:9010:9000" # S3 API
+      - "127.0.0.1:9011:9001" # web console
     volumes:
       - minio_data:/data
     healthcheck:

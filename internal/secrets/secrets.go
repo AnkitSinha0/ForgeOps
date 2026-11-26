@@ -30,6 +30,9 @@ const (
 // because telling them apart would help an attacker probing the format.
 var ErrDecrypt = errors.New("could not decrypt value")
 
+// ErrNoKeys means the Keyring holds no keys: it wasn't made by ParseKeyring.
+var ErrNoKeys = errors.New("keyring has no keys")
+
 // Keyring holds every key that can still open stored values. The highest version
 // seals new values.
 type Keyring struct {
@@ -44,6 +47,7 @@ func ParseKeyring(spec string) (*Keyring, error) {
 		return nil, errors.New("SECRETS_KEYS is required; generate a key with: openssl rand -base64 32, then set SECRETS_KEYS=1:<key>")
 	}
 	k := &Keyring{aeads: make(map[byte]cipher.AEAD)}
+	seen := make(map[string]byte) // key bytes → version, to catch one key listed twice
 	for pair := range strings.SplitSeq(spec, ",") {
 		versionText, encoded, ok := strings.Cut(strings.TrimSpace(pair), ":")
 		if !ok {
@@ -64,6 +68,16 @@ func ParseKeyring(spec string) (*Keyring, error) {
 		if len(raw) != keyBytes {
 			return nil, fmt.Errorf("SECRETS_KEYS: version %d must decode to %d bytes, got %d", v, keyBytes, len(raw))
 		}
+		// All zeros is what a placeholder or a broken generator produces, never a real
+		// key. One key under two versions means a "rotation" that rotated nothing.
+		if !slices.ContainsFunc(raw, func(b byte) bool { return b != 0 }) {
+			return nil, fmt.Errorf("SECRETS_KEYS: version %d is all zero bytes; generate a key with openssl rand -base64 32", v)
+		}
+		key := string(raw)
+		if prev, dup := seen[key]; dup {
+			return nil, fmt.Errorf("SECRETS_KEYS: versions %d and %d are the same key", prev, v)
+		}
+		seen[key] = v
 		block, err := aes.NewCipher(raw)
 		if err != nil {
 			return nil, fmt.Errorf("SECRETS_KEYS: version %d: %w", v, err)
@@ -85,12 +99,17 @@ func ParseKeyring(spec string) (*Keyring, error) {
 // The nonce is random for every call. GCM breaks badly if a key ever reuses a
 // nonce, and 12 random bytes are safe for about 2^32 values per key.
 func (k *Keyring) Seal(plaintext, boundTo []byte) ([]byte, error) {
-	out := make([]byte, 1+nonceBytes, 1+nonceBytes+len(plaintext)+k.aeads[k.current].Overhead())
+	// A Keyring made without ParseKeyring has no keys. Fail, don't dereference nil.
+	aead, ok := k.aeads[k.current]
+	if !ok {
+		return nil, ErrNoKeys
+	}
+	out := make([]byte, 1+nonceBytes, 1+nonceBytes+len(plaintext)+aead.Overhead())
 	out[0] = k.current
 	if _, err := rand.Read(out[1 : 1+nonceBytes]); err != nil {
 		return nil, fmt.Errorf("reading random nonce: %w", err)
 	}
-	return k.aeads[k.current].Seal(out, out[1:1+nonceBytes], plaintext, authData(k.current, boundTo)), nil
+	return aead.Seal(out, out[1:1+nonceBytes], plaintext, authData(k.current, boundTo)), nil
 }
 
 // Open decrypts a value from Seal, using whichever key its version names.
