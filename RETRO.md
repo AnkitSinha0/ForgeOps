@@ -70,3 +70,25 @@
 **DECISIONS.md entries that mattered most:** the upsert tenant check, which corrects an earlier decision's claim; and write-only env vars with row-bound ciphertext, which set up Phase 6's security story.
 
 **Engineering Desk:** one draft in progress, on the foreign key that didn't fire. It's a real failure with a fix, not a clean success.
+
+## Security audit of Phases 0-2 (2026-11-11)
+
+**Intended:** run every test plus security tests over Phases 0-2, and fix what's found before Phase 3 builds on it.
+
+**How:** existing suite (shuffled); `go vet`, staticcheck, gosec and govulncheck; four parallel Sonnet reviewers, one per surface (auth, tenant isolation, secret crypto, HTTP and correctness), each required to prove findings with a throwaway test against real Postgres. Each fix then got a permanent regression test, written first and seen red. Full log: `JIT/SecurityAudit-2026-11-11.md`.
+
+**Went well**
+- Tenant isolation held under a hostile review: no cross-tenant read, write or reference over HTTP, and 160 concurrent hostile upserts didn't touch another tenant's variable. Phase 2's investment there paid off.
+- 18 new regression tests in 6 packages, all red before and green after. The suite went from 42 to 60 tests (+65 subtests), 0 failed and 0 skipped, with 5 full runs green (4 of them shuffled). govulncheck went from 15 reachable vulnerabilities to 0, and gosec and staticcheck report 0 issues.
+
+**Went wrong / surprised us**
+- **The migration lock didn't lock the thing that raced.** Concurrent first boots crashed 5 of 6 times. The comment above `LOCK TABLE` described exactly the scenario that broke, and Phase 1's "applies once across two boots" check ran them one after the other, never at once.
+- 15 known vulnerabilities came from one line in CLAUDE.md ("match HashVault, 1.26.4"). A pinned version needs a reason to stay pinned.
+- Two of my own test mistakes during the fix: Unicode escapes in a test source became literal characters (one a BOM, which Go refuses), and a test reused one project name, so 409s hid the 201s it was checking for. Both were caught by reading the red output, not by the test passing.
+- `Scan` into a named string type (`models.BuildStatus`) reported a missing row for one that existed; `Take` into the model fixed it. I haven't found the cause yet.
+
+**Would change**
+- Test boot and migration concurrently from the start: "runs once" also means "runs once when N copies start together".
+- Run govulncheck at every phase boundary, not only in Phase 14's CI.
+
+**DECISIONS.md entries that mattered most:** the advisory migration lock (a real crash with a precise cause), and the canonical hostname (the unique index only protects the claim if a host has one spelling).
