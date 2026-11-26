@@ -1,0 +1,6 @@
+# The repository stores LF. Without this, Git for Windows with core.autocrlf=true
+# checks every file out with CRLF, and gofmt -l then reports every Go file.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
